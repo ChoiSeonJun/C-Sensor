@@ -1,0 +1,214 @@
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Windows.Forms;
+using System.Globalization;
+using System.Diagnostics;
+using System.Threading;
+using System.IO;
+using Newtonsoft.Json.Linq;
+using System.Collections.Generic;
+using System.Reflection;
+using MySqlX.XDevAPI.Common;
+
+namespace MODBUS_TEST_2
+{
+    public partial class Sensor2 : Form
+    {
+        // TCP/IP 소켓 객체 선언 (서버와 통신할 소켓)
+        Socket Sensor_Sock;
+        
+        // 비동기 데이터 처리를 위한 객체 생성 (버퍼 크기: 99999 바이트)
+        AsyncObject obj = new AsyncObject(99999);
+        
+        // 재연결 여부를 확인하는 변수 (true일 경우 현재 재연결 중)
+        private bool reconnecting = false;
+        
+        // 다중 스레드 환경에서 동기화할 때 사용할 객체 (lock 처리용)
+        private readonly object lockObject = new object();
+        
+        // 온도 값을 저장할 리스트
+        public List<float> temValues = new List<float>();
+        
+        // 현재까지의 재연결 시도 횟수
+        private int reconnectAttempts = 0;
+        
+        // 최대 재연결 시도 횟수 (5번까지만 시도)
+        private const int maxReconnectAttempts = 5;
+        
+        // 재연결 시도 전 대기 시간 (5초)
+        private const int reconnectDelay = 5000;
+        
+        // 서버의 IP 주소 (Modbus TCP 서버 주소)
+        private string serverIp = "10.10.61.111";
+        
+        // 서버의 포트 번호 (Modbus TCP 기본 포트)
+        private int port = 8899;
+
+        // 폼이 로드될 때 실행되는 생성자
+        public Sensor2()
+        {
+            InitializeComponent(); // UI 컴포넌트 초기화
+            SocketSet();  // 소켓 설정 수행
+            ConnServer(); // 서버에 연결 시도
+        }
+
+        // 소켓 객체 생성 및 설정
+        private void SocketSet()
+        {
+            Sensor_Sock = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        }
+
+        // 서버 연결을 위한 메서드
+        private void ConnServer()
+        {
+            string serverip = serverIp;
+            int serverport = port;
+            
+            try
+            {
+                // 기존 연결이 있다면 닫고 새로 연결 시도
+                if (Sensor_Sock != null && Sensor_Sock.Connected)
+                {
+                    Sensor_Sock.Shutdown(SocketShutdown.Both);
+                    Sensor_Sock.Close();
+                }
+                
+                // 서버의 IP 주소를 설정하고 엔드포인트 생성
+                IPAddress serverAddr = IPAddress.Parse(serverip);
+                IPEndPoint clientEP = new IPEndPoint(serverAddr, serverport);
+                
+                // 새로운 소켓 객체 생성
+                Sensor_Sock = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                
+                // 비동기 연결 시작 (ConnectCallback 메서드에서 처리)
+                Sensor_Sock.BeginConnect(clientEP, new AsyncCallback(ConnectCallback), Sensor_Sock);
+                
+                Log($"Sen 1 서버 {serverip}:{serverport}에 연결 시도 중");
+            }
+            catch (Exception ex)
+            {
+                Log($"Sen 1 연결 오류: {ex}");
+                Reconnect(); // 연결 실패 시 재연결 시도
+            }
+            finally
+            {
+                // 타이머 활성화 (타이머는 주기적으로 데이터 요청을 위한 역할 수행)
+                timer1.Enabled = true;
+                timer2.Enabled = true;
+            }
+        }
+
+        // 서버 연결이 완료되었을 때 실행되는 콜백 함수
+        void ConnectCallback(IAsyncResult ar)
+        {
+            try
+            {
+                // 비동기 작업에서 소켓 객체 가져오기
+                Socket client = (Socket)ar.AsyncState;
+                if (client == null)
+                {
+                    Log("Sen 1 소켓이 null입니다.");
+                    Reconnect(); // 재연결 시도
+                    return;
+                }
+                
+                if (!client.Connected)
+                {
+                    Log("Sen 1 소켓이 연결되지 않았습니다.");
+                    Reconnect(); // 연결이 안 된 경우 재연결 시도
+                    return;
+                }
+                
+                // 연결 완료 처리
+                client.EndConnect(ar);
+                
+                if (client.Connected)
+                {
+                    obj.WorkingSocket = Sensor_Sock;
+                    Log("Sen 1 서버에 연결됨.");
+                    
+                    // 비동기 데이터 수신 시작
+                    Sensor_Sock.BeginReceive(obj.Buffer, 0, obj.BufferSize, 0, DataReceived, obj);
+                }
+                else
+                {
+                    Log("Sen 1 서버에 연결 실패.");
+                    Reconnect(); // 연결 실패 시 재연결
+                }
+            }
+            catch (SocketException ex)
+            {
+                Log($"Sen 1 ConnectCallback 오류: {ex.Message}");
+                Reconnect();
+            }
+            catch (ObjectDisposedException ex)
+            {
+                Log($"Sen 1 ConnectCallback 오류: {ex.Message}");
+                Reconnect();
+            }
+            catch (Exception ex)
+            {
+                Log($"Sen 1 예기치 않은 ConnectCallback 오류: {ex}");
+                Reconnect();
+            }
+        }
+
+        // 비동기 데이터 수신 객체 정의
+        public class AsyncObject
+        {
+            public byte[] Buffer; // 데이터를 저장할 바이트 배열
+            public Socket WorkingSocket; // 연결된 소켓 객체
+            public readonly int BufferSize; // 버퍼 크기
+
+            public AsyncObject(int bufferSize)
+            {
+                BufferSize = bufferSize;
+                Buffer = new byte[BufferSize];
+            }
+
+            // 버퍼 초기화 (기존 데이터 삭제)
+            public void ClearBuffer()
+            {
+                Array.Clear(Buffer, 0, BufferSize);
+            }
+        }
+
+        // 데이터 수신 처리
+        void DataReceived(IAsyncResult ar)
+        {
+            try
+            {
+                AsyncObject obj = (AsyncObject)ar.AsyncState;
+
+                if (obj.WorkingSocket == null || !obj.WorkingSocket.Connected)
+                {
+                    Log("Sen 1 소켓이 연결되지 않았습니다.");
+                    Reconnect(); // 연결되지 않은 경우 재연결 시도
+                    return;
+                }
+                
+                // 수신된 데이터 크기 확인
+                int received = obj.WorkingSocket.EndReceive(ar);
+                byte[] buffer = new byte[received];
+                Array.Copy(obj.Buffer, 0, buffer, 0, received);
+
+                Log($"Sen 1 데이터 받음 - 수신된 데이터 크기: {received}, 버퍼: {BitConverter.ToString(buffer)}");
+                
+                // 받은 데이터를 처리하는 메서드 호출
+                ProcessData(buffer);
+                
+                Log("Sen 1 데이터 수신 완료.");
+                
+                // 다시 데이터 수신 시작
+                obj.WorkingSocket.BeginReceive(obj.Buffer, 0, obj.BufferSize, 0, DataReceived, obj);
+            }
+            catch (Exception ex)
+            {
+                Log($"Sen 1 DataReceived 오류: {ex}");
+                Reconnect();
+            }
+        }
+    }
+}
